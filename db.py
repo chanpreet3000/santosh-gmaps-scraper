@@ -33,7 +33,7 @@ class Database:
                 self.client = AsyncIOMotorClient(os.getenv('MONGO_URI'), serverSelectionTimeoutMS=10000)
                 await self.client.server_info()  # Verify connection
                 self.db = self.client['santosh-gmaps']
-                self.queue_collection = self.db['queue']
+                self.queue_collection = self.db['queue2']
 
                 # Create index on scraped field for efficient querying
                 await self.queue_collection.create_index('scraped')
