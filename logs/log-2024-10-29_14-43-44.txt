@@ -1,0 +1,8 @@
+2024-10-29 14:43:45,125 - INFO - Successfully connected to MongoDB
+2024-10-29 14:43:45,128 - INFO - Reading CSV file...
+2024-10-29 14:43:45,518 - INFO - Total rows to process: 85374
+2024-10-29 14:43:45,521 - INFO - Batch size: 1000
+2024-10-29 14:43:45,524 - INFO - Total batches: 86
+2024-10-29 14:46:32,922 - INFO - Processing completed!
+2024-10-29 14:46:32,925 - INFO - Successfully processed and uploaded 85374 rows
+2024-10-29 14:46:32,967 - INFO - Closed MongoDB connection

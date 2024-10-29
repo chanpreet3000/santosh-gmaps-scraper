@@ -1,4 +1,4 @@
-input.xlsx
+input.csv
 output.csv
 # Byte-compiled / optimized / DLL files
 __pycache__/
