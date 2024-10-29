@@ -1,9 +1,10 @@
 from db import Database
 from Logger import Logger
 from typing import Dict, List, Any
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
 import asyncio
+from datetime import datetime
 
 
 class ParallelScraper:
@@ -12,27 +13,51 @@ class ParallelScraper:
         self.batch_size = batch_size
         self.timeout = timeout
         self.max_retries = max_retries
+        self.proxies = self.load_proxies_from_file('proxies.txt')
+        self.current_proxy_index = 0
+        self.session = None
+        self.total_processed = 0
+        Logger.info(f"Initialized scraper with {len(self.proxies)} proxies")
+
+    def load_proxies_from_file(self, file_name: str) -> list[str]:
+        proxies = []
+        with open(file_name, 'r') as file:
+            for line in file:
+                parts = line.strip().split(':')
+                if len(parts) == 4:
+                    proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                    proxies.append(proxy_url)
+        return proxies
 
     async def fetch_url_data(self, url: str) -> Dict[str, str]:
         """
-        Fetch and parse data from the provided HTML
+        Fetch and parse data from the provided URL using aiohttp
         """
         try:
-            # Make the request and get the HTML
-            response = requests.get(url, timeout=self.timeout)
-            response.raise_for_status()
+            proxy_url = self.proxies[self.current_proxy_index]
+            self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxies)
 
-            # Parse the HTML using BeautifulSoup
-            soup = BeautifulSoup(response.text, 'html.parser')
+            async with self.session.get(
+                    url,
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+                    }
+            ) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}")
 
-            # Extract the address and image URL from the meta tags
-            address = soup.select_one('meta[property="og:title"]').get('content')
-            image_url = soup.select_one('meta[property="og:image"]').get('content')
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
 
-            return {
-                'address': address,
-                'image_url': image_url,
-            }
+                address = soup.select_one('meta[property="og:title"]').get('content')
+                image_url = soup.select_one('meta[property="og:image"]').get('content')
+
+                return {
+                    'address': address,
+                    'image_url': image_url,
+                }
 
         except Exception as e:
             raise Exception(f"Error extracting data from HTML: {str(e)}")
@@ -63,7 +88,8 @@ class ParallelScraper:
                 }
             )
 
-            Logger.info(f"Successfully processed record {record_id}", update_data)
+            Logger.info(f"Successfully processed record {record_id}")
+            self.total_processed += 1
             return record_id
 
         except Exception as e:
@@ -80,7 +106,7 @@ class ParallelScraper:
             Logger.error(f"Error processing record {record['_id']}", e)
             return None
 
-    async def process_batch(self, batch: List[Dict[str, Any]]) -> List[str]:
+    async def process_batch(self, batch: List[Dict[str, Any]]):
         """
         Process a batch of records concurrently using asyncio.gather
         """
@@ -89,8 +115,18 @@ class ParallelScraper:
             for record in batch if record['retry_count'] < self.max_retries
         ]
 
-        processed_ids = await asyncio.gather(*tasks)
-        return [record_id for record_id in processed_ids if record_id is not None]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Log batch statistics
+        Logger.info(
+            f"Batch Statistics",
+            {
+                'batch_size': len(batch),
+                'total_processed': self.total_processed,
+                'total_processed_so_far': self.total_processed,
+                'elapsed_time': (datetime.now() - self.start_time).total_seconds()
+            }
+        )
 
     async def run(self):
         """
@@ -99,6 +135,10 @@ class ParallelScraper:
         try:
             # Connect to database
             await self.db.connect()
+
+            # Initialize aiohttp session
+            self.session = aiohttp.ClientSession()
+            self.start_time = datetime.now()
 
             Logger.info("Starting parallel scraping process")
 
@@ -115,8 +155,10 @@ class ParallelScraper:
             Logger.info(f"Found {total_unscraped} unscraped records")
 
             # Process in batches
-            processed_count = 0
+            batch_number = 0
             while True:
+                batch_number += 1
+
                 # Get batch of unscraped records
                 batch = await self.db.queue_collection.find({
                     'scraped': False,
@@ -126,26 +168,33 @@ class ParallelScraper:
                 if not batch:
                     break
 
-                # Process batch
-                processed_ids = await self.process_batch(batch)
-                processed_count += len(processed_ids)
+                Logger.debug(f"Starting batch {batch_number}")
+                await self.process_batch(batch)
 
-            Logger.info(f"Scraping completed! Processed {processed_count} records successfully")
+                # Calculate and log progress
+                progress = (self.total_processed / total_unscraped) * 100
 
-            # Log final statistics
-            failed_count = await self.db.queue_collection.count_documents({
-                'processing_status': 'failed'
+                Logger.info(
+                    "Progress Update",
+                    {
+                        'batch_number': batch_number,
+                        'progress_percentage': f"{progress:.2f}%",
+                        'records_processed': self.total_processed,
+                        'total_records': total_unscraped,
+                    }
+                )
+
+            processed = await self.db.queue_collection.count_documents({
+                'scraped': True
             })
-            retry_exceeded = await self.db.queue_collection.count_documents({
-                'retry_count': {'$gte': self.max_retries}
-            })
 
-            Logger.info(f"Failed records: {failed_count}")
-            Logger.info(f"Retry limit exceeded: {retry_exceeded}")
+            Logger.info(f"Scraping Completed {processed} records.")
 
         except Exception as e:
             Logger.error("Error in scraping process", e)
         finally:
+            if self.session:
+                await self.session.close()
             await self.db.close()
 
 
@@ -153,7 +202,7 @@ async def main():
     scraper = ParallelScraper(
         batch_size=10,
         timeout=10,
-        max_retries=10
+        max_retries=5
     )
     await scraper.run()
 
