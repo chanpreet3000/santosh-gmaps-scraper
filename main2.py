@@ -1,14 +1,15 @@
+import time
+
 from db import Database
 from Logger import Logger
 from typing import Dict, List, Any
 import aiohttp
 from bs4 import BeautifulSoup
 import asyncio
-from datetime import datetime
 
 
 class ParallelScraper:
-    def __init__(self, batch_size: int = 10, timeout: int = 10, max_retries: int = 3):
+    def __init__(self, batch_size: int = 10, timeout: int = 10, max_retries: int = 3, batch_delay: int = 5):
         self.db = Database()
         self.batch_size = batch_size
         self.timeout = timeout
@@ -17,6 +18,7 @@ class ParallelScraper:
         self.current_proxy_index = 0
         self.session = None
         self.total_processed = 0
+        self.batch_delay = batch_delay
         Logger.info(f"Initialized scraper with {len(self.proxies)} proxies")
 
     def load_proxies_from_file(self, file_name: str) -> list[str]:
@@ -117,17 +119,6 @@ class ParallelScraper:
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Log batch statistics
-        Logger.info(
-            f"Batch Statistics",
-            {
-                'batch_size': len(batch),
-                'total_processed': self.total_processed,
-                'total_processed_so_far': self.total_processed,
-                'elapsed_time': (datetime.now() - self.start_time).total_seconds()
-            }
-        )
-
     async def run(self):
         """
         Main method to run the scraper
@@ -138,7 +129,6 @@ class ParallelScraper:
 
             # Initialize aiohttp session
             self.session = aiohttp.ClientSession()
-            self.start_time = datetime.now()
 
             Logger.info("Starting parallel scraping process")
 
@@ -183,6 +173,8 @@ class ParallelScraper:
                         'total_records': total_unscraped,
                     }
                 )
+                Logger.info(f'Sleeping for {self.batch_delay} seconds')
+                time.sleep(self.batch_delay)
 
             processed = await self.db.queue_collection.count_documents({
                 'scraped': True
@@ -202,7 +194,8 @@ async def main():
     scraper = ParallelScraper(
         batch_size=10,
         timeout=10,
-        max_retries=5
+        max_retries=5,
+        batch_delay=5,
     )
     await scraper.run()
 
