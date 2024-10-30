@@ -24,6 +24,7 @@ class Database:
         self.client = None
         self.db = None
         self.queue_collection = None
+        self.images_queue_collection = None
         self._initialized = True
 
     async def connect(self):
@@ -34,9 +35,11 @@ class Database:
                 await self.client.server_info()  # Verify connection
                 self.db = self.client['santosh-gmaps']
                 self.queue_collection = self.db['queue2']
+                self.images_queue_collection = self.db['images_queue2']
 
                 # Create index on scraped field for efficient querying
                 await self.queue_collection.create_index('scraped')
+                await self.images_queue_collection.create_index('images_scraped')
 
                 Logger.info("Successfully connected to MongoDB")
             except Exception as e:
