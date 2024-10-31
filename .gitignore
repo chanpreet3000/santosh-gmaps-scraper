@@ -1,6 +1,6 @@
 input.csv
-output.csv
-output2.csv
+output*.csv
+pincodes.csv
 /images
 logs
 proxies.txt

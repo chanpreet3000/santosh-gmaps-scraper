@@ -21,6 +21,8 @@ def process_in_batches(source_collection, destination_collection, batch_size=100
                 # Create a new document without the _id field
                 new_doc = {k: v for k, v in doc.items() if k != '_id'}
                 new_doc['images_scraped'] = False
+                new_doc['retry_count'] = 0
+                new_doc['processing_status'] = 'pending'
                 batch_documents.append(new_doc)
             except StopIteration:
                 break
@@ -45,7 +47,7 @@ def main():
 
         # Source and destination collections
         source_collection = db["queue"]
-        destination_collection = db["images_queue2"]
+        destination_collection = db["images_queue"]
 
         # Get total count for progress tracking
         total_documents = source_collection.count_documents({})
@@ -55,7 +57,7 @@ def main():
         total_processed = process_in_batches(
             source_collection,
             destination_collection,
-            batch_size=1000
+            batch_size=10000
         )
 
         print(f"\nTransfer completed!")

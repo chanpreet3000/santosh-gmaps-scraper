@@ -1,142 +1,204 @@
-import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-import csv
-from tqdm import tqdm
-import concurrent.futures
 import time
-from contextlib import contextmanager
+
+from db import Database
+from Logger import Logger
+from typing import Dict, List, Any
+import aiohttp
+from bs4 import BeautifulSoup
+import asyncio
 
 
-class GoogleMapsScraper:
-    def __init__(self, max_workers=4, max_retries=3):
-        self.max_workers = max_workers
+class ParallelScraper:
+    def __init__(self, batch_size: int = 10, timeout: int = 10, max_retries: int = 3, batch_delay: int = 5):
+        self.db = Database()
+        self.batch_size = batch_size
+        self.timeout = timeout
         self.max_retries = max_retries
+        self.proxies = self.load_proxies_from_file('proxies.txt')
+        self.current_proxy_index = 0
+        self.session = None
+        self.total_processed = 0
+        self.batch_delay = batch_delay
+        Logger.info(f"Initialized scraper with {len(self.proxies)} proxies")
 
-    def get_chrome_options(self):
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument(
-            f'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36')
-        return chrome_options
+    def load_proxies_from_file(self, file_name: str) -> list[str]:
+        proxies = []
+        with open(file_name, 'r') as file:
+            for line in file:
+                parts = line.strip().split(':')
+                if len(parts) == 4:
+                    proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+                    proxies.append(proxy_url)
+        return proxies
 
-    @contextmanager
-    def create_driver(self):
-        driver = webdriver.Chrome(options=self.get_chrome_options())
-        try:
-            yield driver
-        finally:
-            driver.quit()
-
-    def get_meta_data(self, driver):
-        """Use JavaScript to extract meta tag data"""
-        script = """
-        return {
-            address: (() => {
-                const metaTags = document.getElementsByTagName('meta');
-                for (let i = 0; i < metaTags.length; i++) {
-                    const property = metaTags[i].getAttribute('property');
-                    if (property === 'og:title') {
-                        return metaTags[i].getAttribute('content');
-                    }
-                }
-                return null;
-            })(),
-            image: (() => {
-                const metaTags = document.getElementsByTagName('meta');
-                for (let i = 0; i < metaTags.length; i++) {
-                    const property = metaTags[i].getAttribute('property');
-                    if (property === 'og:image') {
-                        return metaTags[i].getAttribute('content');
-                    }
-                }
-                return null;
-            })()
-        }
+    async def fetch_url_data(self, url: str) -> Dict[str, str]:
         """
-        return driver.execute_script(script)
-
-    def scrape_place_data(self, row):
+        Fetch and parse data from the provided URL using aiohttp
+        """
         try:
-            city_id = row['CityID']
-            url = row['URL']
-            unknown = row['Unknown']
-            place_name = row['PlaceName']
-            category_id = row['CategoryID']
+            proxy_url = self.proxies[self.current_proxy_index]
+            self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxies)
 
-            if pd.isna(url) or not isinstance(url, str):
-                return [city_id, url, unknown, place_name, category_id, "", ""]
+            async with self.session.get(
+                    url,
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+                    }
+            ) as response:
+                if response.status != 200:
+                    raise Exception(f"HTTP {response.status}")
 
-            with self.create_driver() as driver:
-                for attempt in range(self.max_retries):
-                    driver.get(url)
-                    time.sleep(2)  # Initial wait for page load
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
 
-                    # Get meta data using JavaScript
-                    meta_data = self.get_meta_data(driver)
-                    address = meta_data.get('address', '')
-                    image_url = meta_data.get('image', '')
+                address = soup.select_one('meta[property="og:title"]').get('content')
+                image_url = soup.select_one('meta[property="og:image"]').get('content')
 
-                    # If either value is null/empty, refresh and try again
-                    if not address or not image_url:
-                        print(f"Attempt {attempt + 1}: Missing data, retrying...")
-                        driver.refresh()
-                        time.sleep(2)  # Wait after refresh
-                        continue
-                    else:
-                        print(f"Attempt {attempt + 1}: Data retrieved successfully", address, image_url)
-                        break
-
-                # Log if we still don't have data after all retries
-                if not address or not image_url:
-                    print(f"Failed to get complete data for {url} after {self.max_retries} attempts")
-
-                return [city_id, url, unknown, place_name, category_id, address, image_url]
+                return {
+                    'address': address,
+                    'image_url': image_url,
+                }
 
         except Exception as e:
-            print(f"Error scraping data from {url}: {e}")
-            return [city_id, url, unknown, place_name, category_id, "", ""]
+            raise Exception(f"Error extracting data from HTML: {str(e)}")
 
-    def process_excel(self, input_file, output_file):
+    async def process_record(self, record: Dict[str, Any]) -> Dict[str, Any] | None:
+        """
+        Process a single record
+        """
         try:
-            # Read Excel file
-            df = pd.read_excel(input_file, names=['CityID', 'URL', 'Unknown', 'PlaceName', 'CategoryID'])
+            url = record['link']
+            record_id = record['_id']
 
-            all_results = []
+            scraped_data = await self.fetch_url_data(url)
 
-            # Process all rows in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_row = {executor.submit(self.scrape_place_data, row): row
-                                 for row in df.to_dict('records')}
+            # Update record
+            update_data = {
+                'scraped': True,
+                'processing_status': 'processed',
+                'address': scraped_data['address'],
+                'image_url': scraped_data['image_url'],
+            }
 
-                # Collect results with progress bar
-                for future in tqdm(concurrent.futures.as_completed(future_to_row),
-                                   total=len(future_to_row),
-                                   desc="Scraping places"):
-                    result = future.result()
-                    all_results.append(result)
+            await self.db.queue_collection.update_one(
+                {'_id': record_id},
+                {
+                    '$set': update_data,
+                    '$inc': {'retry_count': 1}
+                }
+            )
 
-            # Write all results to CSV at once
-            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['City ID', 'URL', 'Unknown', 'Place Name', 'Category ID', 'Address', 'Image URL'])
-                writer.writerows(all_results)
+            Logger.info(f"Successfully processed record {record_id}")
+            self.total_processed += 1
+            return record_id
 
         except Exception as e:
-            print(f"Error processing Excel file: {e}")
+            await self.db.queue_collection.update_one(
+                {'_id': record['_id']},
+                {
+                    '$set': {
+                        'processing_status': 'failed',
+                    },
+                    '$inc': {'retry_count': 1}
+                }
+            )
+
+            Logger.error(f"Error processing record {record['_id']}", e)
+            return None
+
+    async def process_batch(self, batch: List[Dict[str, Any]]):
+        """
+        Process a batch of records concurrently using asyncio.gather
+        """
+        tasks = [
+            self.process_record(record)
+            for record in batch if record['retry_count'] < self.max_retries
+        ]
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def run(self):
+        """
+        Main method to run the scraper
+        """
+        try:
+            # Connect to database
+            await self.db.connect()
+
+            # Initialize aiohttp session
+            self.session = aiohttp.ClientSession()
+
+            Logger.info("Starting parallel scraping process")
+
+            # Get total count of unscraped records
+            total_unscraped = await self.db.queue_collection.count_documents({
+                'scraped': False,
+                'retry_count': {'$lt': self.max_retries}
+            })
+
+            if total_unscraped == 0:
+                Logger.info("No unscraped records found")
+                return
+
+            Logger.info(f"Found {total_unscraped} unscraped records")
+
+            # Process in batches
+            batch_number = 0
+            while True:
+                batch_number += 1
+
+                # Get batch of unscraped records
+                batch = await self.db.queue_collection.find({
+                    'scraped': False,
+                    'retry_count': {'$lt': self.max_retries}
+                }).limit(self.batch_size).to_list(length=self.batch_size)
+
+                if not batch:
+                    break
+
+                Logger.debug(f"Starting batch {batch_number}")
+                await self.process_batch(batch)
+
+                # Calculate and log progress
+                progress = (self.total_processed / total_unscraped) * 100
+
+                Logger.info(
+                    "Progress Update",
+                    {
+                        'batch_number': batch_number,
+                        'progress_percentage': f"{progress:.2f}%",
+                        'records_processed': self.total_processed,
+                        'total_records': total_unscraped,
+                    }
+                )
+                Logger.info(f'Sleeping for {self.batch_delay} seconds')
+                time.sleep(self.batch_delay)
+
+            processed = await self.db.queue_collection.count_documents({
+                'scraped': True
+            })
+
+            Logger.info(f"Scraping Completed {processed} records.")
+
+        except Exception as e:
+            Logger.error("Error in scraping process", e)
+        finally:
+            if self.session:
+                await self.session.close()
+            await self.db.close()
 
 
-def main():
-    scraper = GoogleMapsScraper(max_workers=10, max_retries=3)
-    input_file = 'input.xlsx'
-    output_file = 'output.csv'
-
-    print(f"Starting to process {input_file}")
-    scraper.process_excel(input_file, output_file)
-    print(f"Processing complete. Results saved to {output_file}")
+async def main():
+    scraper = ParallelScraper(
+        batch_size=10,
+        timeout=10,
+        max_retries=5,
+        batch_delay=5,
+    )
+    await scraper.run()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

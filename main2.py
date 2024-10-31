@@ -1,47 +1,36 @@
 import time
-
-from db import Database
-from Logger import Logger
-from typing import Dict, List, Any
+import os
+import uuid
 import aiohttp
-from bs4 import BeautifulSoup
 import asyncio
+from typing import Dict, List, Any
+from Logger import Logger
+from db import Database
 
 
-class ParallelScraper:
+class ParallelImageDownloader:
     def __init__(self, batch_size: int = 10, timeout: int = 10, max_retries: int = 3, batch_delay: int = 5):
         self.db = Database()
         self.batch_size = batch_size
         self.timeout = timeout
         self.max_retries = max_retries
-        self.proxies = self.load_proxies_from_file('proxies.txt')
-        self.current_proxy_index = 0
+        self.batch_delay = batch_delay
         self.session = None
         self.total_processed = 0
-        self.batch_delay = batch_delay
-        Logger.info(f"Initialized scraper with {len(self.proxies)} proxies")
+        self.images_dir = 'images'
 
-    def load_proxies_from_file(self, file_name: str) -> list[str]:
-        proxies = []
-        with open(file_name, 'r') as file:
-            for line in file:
-                parts = line.strip().split(':')
-                if len(parts) == 4:
-                    proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-                    proxies.append(proxy_url)
-        return proxies
+        # Create images directory if it doesn't exist
+        os.makedirs(self.images_dir, exist_ok=True)
+        Logger.info(f"Initialized image downloader")
 
-    async def fetch_url_data(self, url: str) -> Dict[str, str]:
+    async def download_image(self, image_url: str) -> str:
         """
-        Fetch and parse data from the provided URL using aiohttp
+        Download image from URL and save it with a unique name
+        Returns the saved image filename
         """
         try:
-            proxy_url = self.proxies[self.current_proxy_index]
-            self.current_proxy_index = (self.current_proxy_index + 1) % len(self.proxies)
-
             async with self.session.get(
-                    url,
-                    proxy=proxy_url,
+                    image_url,
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                     headers={
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
@@ -50,39 +39,43 @@ class ParallelScraper:
                 if response.status != 200:
                     raise Exception(f"HTTP {response.status}")
 
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+                # Generate unique filename using UUID
+                file_extension = image_url.split('.')[-1].split('?')[0]  # Handle URLs with query parameters
+                if not file_extension or len(file_extension) > 4:
+                    file_extension = 'jpg'  # Default to jpg if no valid extension found
 
-                address = soup.select_one('meta[property="og:title"]').get('content')
-                image_url = soup.select_one('meta[property="og:image"]').get('content')
+                filename = f"{uuid.uuid4()}.{file_extension}"
+                filepath = os.path.join(self.images_dir, filename)
 
-                return {
-                    'address': address,
-                    'image_url': image_url,
-                }
+                # Save image
+                content = await response.read()
+                with open(filepath, 'wb') as f:
+                    f.write(content)
+
+                return filename
 
         except Exception as e:
-            raise Exception(f"Error extracting data from HTML: {str(e)}")
+            raise Exception(f"Error downloading image: {str(e)}")
 
     async def process_record(self, record: Dict[str, Any]) -> Dict[str, Any] | None:
         """
         Process a single record
         """
         try:
-            url = record['link']
             record_id = record['_id']
+            image_url = record['image_url']
 
-            scraped_data = await self.fetch_url_data(url)
+            # Download image
+            image_filename = await self.download_image(image_url)
 
             # Update record
             update_data = {
-                'scraped': True,
-                'processing_status': 'processed',
-                'address': scraped_data['address'],
-                'image_url': scraped_data['image_url'],
+                'images_scraped': True,
+                'image_filename': image_filename,
+                'processing_status': 'processed'
             }
 
-            await self.db.queue_collection.update_one(
+            await self.db.images_queue_collection.update_one(
                 {'_id': record_id},
                 {
                     '$set': update_data,
@@ -90,12 +83,12 @@ class ParallelScraper:
                 }
             )
 
-            Logger.info(f"Successfully processed record {record_id}")
+            Logger.info(f"Successfully downloaded image for record {record_id}")
             self.total_processed += 1
             return record_id
 
         except Exception as e:
-            await self.db.queue_collection.update_one(
+            await self.db.images_queue_collection.update_one(
                 {'_id': record['_id']},
                 {
                     '$set': {
@@ -121,7 +114,7 @@ class ParallelScraper:
 
     async def run(self):
         """
-        Main method to run the scraper
+        Main method to run the image downloader
         """
         try:
             # Connect to database
@@ -130,28 +123,30 @@ class ParallelScraper:
             # Initialize aiohttp session
             self.session = aiohttp.ClientSession()
 
-            Logger.info("Starting parallel scraping process")
+            Logger.info("Starting parallel image downloading process")
 
-            # Get total count of unscraped records
-            total_unscraped = await self.db.queue_collection.count_documents({
-                'scraped': False,
+            # Get total count of unprocessed images
+            total_unprocessed = await self.db.images_queue_collection.count_documents({
+                'images_scraped': False,
+                'scraped': True,  # Only process records that have been scraped
                 'retry_count': {'$lt': self.max_retries}
             })
 
-            if total_unscraped == 0:
-                Logger.info("No unscraped records found")
+            if total_unprocessed == 0:
+                Logger.info("No unprocessed images found")
                 return
 
-            Logger.info(f"Found {total_unscraped} unscraped records")
+            Logger.info(f"Found {total_unprocessed} unprocessed images")
 
             # Process in batches
             batch_number = 0
             while True:
                 batch_number += 1
 
-                # Get batch of unscraped records
-                batch = await self.db.queue_collection.find({
-                    'scraped': False,
+                # Get batch of unprocessed records
+                batch = await self.db.images_queue_collection.find({
+                    'images_scraped': False,
+                    'scraped': True,
                     'retry_count': {'$lt': self.max_retries}
                 }).limit(self.batch_size).to_list(length=self.batch_size)
 
@@ -162,7 +157,7 @@ class ParallelScraper:
                 await self.process_batch(batch)
 
                 # Calculate and log progress
-                progress = (self.total_processed / total_unscraped) * 100
+                progress = (self.total_processed / total_unprocessed) * 100
 
                 Logger.info(
                     "Progress Update",
@@ -170,20 +165,20 @@ class ParallelScraper:
                         'batch_number': batch_number,
                         'progress_percentage': f"{progress:.2f}%",
                         'records_processed': self.total_processed,
-                        'total_records': total_unscraped,
+                        'total_records': total_unprocessed,
                     }
                 )
                 Logger.info(f'Sleeping for {self.batch_delay} seconds')
                 time.sleep(self.batch_delay)
 
-            processed = await self.db.queue_collection.count_documents({
-                'scraped': True
+            processed = await self.db.images_queue_collection.count_documents({
+                'images_scraped': True
             })
 
-            Logger.info(f"Scraping Completed {processed} records.")
+            Logger.info(f"Image downloading completed. {processed} images downloaded.")
 
         except Exception as e:
-            Logger.error("Error in scraping process", e)
+            Logger.error("Error in image downloading process", e)
         finally:
             if self.session:
                 await self.session.close()
@@ -191,13 +186,13 @@ class ParallelScraper:
 
 
 async def main():
-    scraper = ParallelScraper(
-        batch_size=10,
-        timeout=10,
+    downloader = ParallelImageDownloader(
+        batch_size=100,
+        timeout=15,
         max_retries=5,
-        batch_delay=5,
+        batch_delay=0,
     )
-    await scraper.run()
+    await downloader.run()
 
 
 if __name__ == "__main__":
