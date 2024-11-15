@@ -1,18 +1,21 @@
 import pandas as pd
-from pymongo import MongoClient
-import os
-from dotenv import load_dotenv
+import asyncio
 
-load_dotenv()
+from db import Database
 
-# Connect to MongoDB
-client = MongoClient(os.getenv('MONGO_URI'))
-db = client["santosh-gmaps"]
-collection = db["queue"]
 
-# Fetch data from the collection
-data = list(collection.find({}))
+async def main():
+    db = Database()
+    await db.connect()
+    data = list
 
-# Create a DataFrame and save it as CSV
-df = pd.DataFrame(data)
-df.to_csv("output2.csv", index=False)
+    # Fetch data from the collection
+    data = list(db.queue_collection.find({}))
+
+    # Create a DataFrame and save it as CSV
+    df = pd.DataFrame(data)
+    df.to_csv("output.csv", index=False)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

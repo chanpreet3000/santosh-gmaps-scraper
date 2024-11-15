@@ -6,7 +6,7 @@ from tqdm import tqdm
 from Logger import Logger
 
 
-class CSVProcessor:
+class InsertDataManager:
     def __init__(self, batch_size: int = 1000):
         self.batch_size = batch_size
         self.db = Database()
@@ -22,6 +22,7 @@ class CSVProcessor:
             'title': row['title'],
             'section_id': str(row['section_id']),
             'scraped': False,
+            'images_scraped': False,
             'processing_status': 'pending',
             'retry_count': 0
         }
@@ -118,7 +119,7 @@ class CSVProcessor:
 
 async def main():
     input_file = "input.csv"
-    processor = CSVProcessor(batch_size=1000)
+    processor = InsertDataManager(batch_size=5000)
     await processor.process_csv(input_file)
 
 

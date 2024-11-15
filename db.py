@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 from typing import List, Dict, Any
 from datetime import datetime
-from Logger import Logger  # Import Logger
+from Logger import Logger
 
 load_dotenv()
 
@@ -24,7 +24,6 @@ class Database:
         self.client = None
         self.db = None
         self.queue_collection = None
-        self.images_queue_collection = None
         self._initialized = True
 
     async def connect(self):
@@ -34,46 +33,14 @@ class Database:
                 self.client = AsyncIOMotorClient(os.getenv('MONGO_URI'), serverSelectionTimeoutMS=10000)
                 await self.client.server_info()  # Verify connection
                 self.db = self.client['santosh-gmaps']
-                self.queue_collection = self.db['queue2']
-                self.images_queue_collection = self.db['images_queue2']
+                self.queue_collection = self.db['queue']
 
                 # Create index on scraped field for efficient querying
                 await self.queue_collection.create_index('scraped')
-                await self.images_queue_collection.create_index('images_scraped')
 
                 Logger.info("Successfully connected to MongoDB")
             except Exception as e:
                 Logger.error(f"Failed to connect to MongoDB: {str(e)}")
-
-    async def insert_queue_item(self, item: Dict[str, Any]) -> str:
-        # Add metadata
-        item['scraped'] = False
-        item['created_at'] = datetime.utcnow()
-        item['updated_at'] = datetime.utcnow()
-
-        result = await self.queue_collection.insert_one(item)
-        Logger.info(f"Inserted item with ID: {str(result.inserted_id)}")
-        return str(result.inserted_id)
-
-    async def get_unscraped_items(self) -> List[Dict[str, Any]]:
-        cursor = self.queue_collection.find({'scraped': False})
-        items = await cursor.to_list(length=None)
-        return items
-
-    async def mark_as_scraped(self, item_id: str) -> bool:
-        from bson.objectid import ObjectId
-
-        result = await self.queue_collection.update_one(
-            {'_id': ObjectId(item_id)},
-            {
-                '$set': {
-                    'scraped': True,
-                    'updated_at': datetime.utcnow()
-                }
-            }
-        )
-
-        return result.modified_count > 0
 
     async def close(self):
         """Close the database connection"""
